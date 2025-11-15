@@ -171,214 +171,44 @@ async def _auto_delete_messages(chat_id: int, message_ids: List[int], delay: int
         except Exception:
             pass
 
-# ------------------ start handler (deep-link) ------------------
-@dp.message(CommandStart())
-async def on_start_with_payload(message: Message):
-    args = (message.text or "").split(maxsplit=1)
-    
-    # No payload - welcome message for admins
-    if len(args) == 1:
-        if is_admin(message.from_user.id):
-            return await message.answer(
-                "👋 <b>Welcome Admin!</b>\n\n"
-                "📤 Send me media (photos/videos/documents) to create shareable albums.\n"
-                "🔗 I'll give you a link to share in your group!\n\n"
-                "Use /panel for admin commands."
-            )
-        else:
-            return  # Silent for non-admins
-    
-    payload = args[1].strip()
-    if "start=" in payload:
-        payload = payload.split("start=", 1)[1].strip()
-    album_key = payload
-
-    album = await albums_col.find_one({"album_key": album_key})
-    if not album:
-        return  # Silent fail for invalid links
-
-    if not await is_user_qualified(GROUP_ID, message.from_user.id):
-        return  # Silent fail for non-qualified users
-
-    files = album.get("file_ids", [])
-    if not files:
-        return
-
-    # Send album to group
-    try:
-        if len(files) == 1:
-            f = files[0]
-            f_id = f["file_id"]
-            f_type = f.get("type", "document")
-            caption = f.get("caption")
-            
-            if f_type == "photo":
-                sent = await bot.send_photo(chat_id=GROUP_ID, photo=f_id, caption=caption)
-            elif f_type == "video":
-                sent = await bot.send_video(chat_id=GROUP_ID, video=f_id, caption=caption)
-            else:
-                sent = await bot.send_document(chat_id=GROUP_ID, document=f_id, caption=caption)
-            posted_ids = [sent.message_id]
-        else:
-            media = []
-            for idx, f in enumerate(files):
-                f_id = f["file_id"]
-                f_type = f.get("type", "document")
-                caption = f.get("caption") if idx == 0 else None
-                
-                if f_type == "photo":
-                    media.append(InputMediaPhoto(media=f_id, caption=caption))
-                elif f_type == "video":
-                    media.append(InputMediaVideo(media=f_id, caption=caption))
-                else:
-                    media.append(InputMediaDocument(media=f_id, caption=caption))
-            
-            sent_msgs = await bot.send_media_group(chat_id=GROUP_ID, media=media)
-            posted_ids = [m.message_id for m in sent_msgs]
-    except Exception as e:
-        logger.exception(f"Failed to send album: {e}")
-        return
-
-    try:
-        await published_col.insert_one({
-            "album_key": album_key,
-            "chat_id": GROUP_ID,
-            "message_ids": posted_ids,
-            "published_at": int(asyncio.get_event_loop().time())
-        })
-    except Exception:
-        pass
-
-    delay = await get_delete_seconds()
-    asyncio.create_task(_auto_delete_messages(GROUP_ID, posted_ids, delay))
-
-# ------------------ catch admin uploads in DM ------------------
-@dp.message(F.chat.type == "private")
-async def catch_private_uploads(message: Message):
-    user = message.from_user
-    if not is_admin(user.id):
-        return  # Silent for non-admins
-
-    mgid = getattr(message, "media_group_id", None)
-
-    # Determine file id, type, and caption
-    file_id = None
-    f_type = None
-    caption = message.caption or None
-    
-    if message.photo:
-        file_id = message.photo[-1].file_id
-        f_type = "photo"
-    elif message.video:
-        file_id = message.video.file_id
-        f_type = "video"
-    elif message.document:
-        file_id = message.document.file_id
-        f_type = "document"
-    elif message.audio:
-        file_id = message.audio.file_id
-        f_type = "document"
-    elif message.animation:
-        file_id = message.animation.file_id
-        f_type = "document"
-
-    if mgid:
-        key = f"{user.id}:{mgid}"
-        if key not in _media_buffers:
-            _media_buffers[key] = {
-                "files": [], 
-                "chat_id": message.chat.id, 
-                "uploader": user.id, 
-                "timer": None
-            }
-        
-        if file_id:
-            _media_buffers[key]["files"].append({
-                "file_id": file_id, 
-                "type": f_type,
-                "caption": caption
-            })
-        
-        # Forward to DB channel
-        try:
-            await message.forward(chat_id=DB_CHANNEL_ID)
-        except Exception:
-            logger.warning("Forward to DB channel failed")
-        
-        # Reset timer
-        if _media_buffers[key].get("timer"):
-            _media_buffers[key]["timer"].cancel()
-        _schedule_finalize(key, delay=1.0)
-        return
-
-    # Single file (no media_group_id)
-    if file_id:
-        try:
-            await message.forward(chat_id=DB_CHANNEL_ID)
-        except Exception:
-            logger.warning("Forward single to DB channel failed")
-        
-        album_key = make_key()
-        doc = {
-            "album_key": album_key,
-            "file_ids": [{
-                "file_id": file_id, 
-                "type": f_type,
-                "caption": caption
-            }],
-            "uploader_id": user.id,
-            "created_at": int(asyncio.get_event_loop().time()),
-            "published": []
-        }
-        await albums_col.insert_one(doc)
-        
-        bot_username = (await bot.get_me()).username
-        link = f"https://t.me/{bot_username}?start={album_key}"
-        
-        try:
-            await message.answer(
-                f"✅ <b>Album saved successfully!</b>\n\n"
-                f"📁 <b>Album Key:</b> <code>{album_key}</code>\n"
-                f"🔗 <b>Direct Link:</b> {link}\n\n"
-                f"💡 <i>Share this link in the group!</i>"
-            )
-        except Exception:
-            logger.exception("Failed to notify admin for single album")
-
-# ------------------ admin panel command ------------------
+# ------------------ admin panel command (MUST BE BEFORE OTHER HANDLERS) ------------------
 @dp.message(Command("panel"))
 async def cmd_panel(message: Message):
     if not is_admin(message.from_user.id):
         return
     
-    mode = await get_mode()
-    delete_time = await get_delete_seconds()
-    qualified_users = await get_qualified_users(GROUP_ID)
-    
-    mode_status = "🔒 <b>WHITELIST MODE</b>" if mode == "qualified" else "🌍 <b>PEACE MODE</b>"
-    
-    panel_text = (
-        "⚙️ <b>ADMIN CONTROL PANEL</b>\n"
-        "━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📊 <b>Current Status:</b>\n"
-        f"   • Mode: {mode_status}\n"
-        f"   • Auto-delete: {delete_time} seconds ({delete_time//60} minutes)\n"
-        f"   • Qualified users: {len(qualified_users)}\n\n"
-        "📝 <b>Available Commands:</b>\n\n"
-        "<b>Protection Mode:</b>\n"
-        "   /mode_on - Enable whitelist (only allowed users)\n"
-        "   /mode_off - Disable whitelist (everyone can access)\n\n"
-        "<b>User Management:</b>\n"
-        "   /allow [reply to user] - Add user to whitelist\n"
-        "   /disallow [reply to user] - Remove user from whitelist\n"
-        "   /list_allowed - Show all whitelisted users\n\n"
-        "<b>Settings:</b>\n"
-        "   /set_delete_time [seconds] - Set auto-delete timer\n"
-        "   /panel - Show this panel\n\n"
-        "💡 <b>Tip:</b> Reply to any user's message with /allow or /disallow"
-    )
-    
-    await message.answer(panel_text)
+    try:
+        mode = await get_mode()
+        delete_time = await get_delete_seconds()
+        qualified_users = await get_qualified_users(GROUP_ID)
+        
+        mode_status = "🔒 <b>WHITELIST MODE</b>" if mode == "qualified" else "🌍 <b>PEACE MODE</b>"
+        
+        panel_text = (
+            "⚙️ <b>ADMIN CONTROL PANEL</b>\n"
+            "━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 <b>Current Status:</b>\n"
+            f"   • Mode: {mode_status}\n"
+            f"   • Auto-delete: {delete_time} seconds ({delete_time//60} minutes)\n"
+            f"   • Qualified users: {len(qualified_users)}\n\n"
+            "📝 <b>Available Commands:</b>\n\n"
+            "<b>Protection Mode:</b>\n"
+            "   /mode_on - Enable whitelist (only allowed users)\n"
+            "   /mode_off - Disable whitelist (everyone can access)\n\n"
+            "<b>User Management:</b>\n"
+            "   /allow [reply to user] - Add user to whitelist\n"
+            "   /disallow [reply to user] - Remove user from whitelist\n"
+            "   /list_allowed - Show all whitelisted users\n\n"
+            "<b>Settings:</b>\n"
+            "   /set_delete_time [seconds] - Set auto-delete timer\n"
+            "   /panel - Show this panel\n\n"
+            "💡 <b>Tip:</b> Reply to any user's message with /allow or /disallow"
+        )
+        
+        await message.answer(panel_text)
+    except Exception as e:
+        logger.exception(f"Error in panel command: {e}")
+        await message.answer(f"❌ Error: {e}")
 
 # ------------------ admin commands ------------------
 @dp.message(Command("mode_on"))
@@ -554,6 +384,180 @@ async def cmd_set_delete_time(msg: Message):
         )
     except Exception:
         return await msg.reply("❌ Invalid number. Use whole numbers only.")
+
+# ------------------ start handler (deep-link) ------------------
+@dp.message(CommandStart())
+async def on_start_with_payload(message: Message):
+    args = (message.text or "").split(maxsplit=1)
+    
+    # No payload - welcome message for admins
+    if len(args) == 1:
+        if is_admin(message.from_user.id):
+            return await message.answer(
+                "👋 <b>Welcome Admin!</b>\n\n"
+                "📤 Send me media (photos/videos/documents) to create shareable albums.\n"
+                "🔗 I'll give you a link to share in your group!\n\n"
+                "Use /panel for admin commands."
+            )
+        else:
+            return  # Silent for non-admins
+    
+    payload = args[1].strip()
+    if "start=" in payload:
+        payload = payload.split("start=", 1)[1].strip()
+    album_key = payload
+
+    album = await albums_col.find_one({"album_key": album_key})
+    if not album:
+        return  # Silent fail for invalid links
+
+    if not await is_user_qualified(GROUP_ID, message.from_user.id):
+        return  # Silent fail for non-qualified users
+
+    files = album.get("file_ids", [])
+    if not files:
+        return
+
+    # Send album to group
+    try:
+        if len(files) == 1:
+            f = files[0]
+            f_id = f["file_id"]
+            f_type = f.get("type", "document")
+            caption = f.get("caption")
+            
+            if f_type == "photo":
+                sent = await bot.send_photo(chat_id=GROUP_ID, photo=f_id, caption=caption)
+            elif f_type == "video":
+                sent = await bot.send_video(chat_id=GROUP_ID, video=f_id, caption=caption)
+            else:
+                sent = await bot.send_document(chat_id=GROUP_ID, document=f_id, caption=caption)
+            posted_ids = [sent.message_id]
+        else:
+            media = []
+            for idx, f in enumerate(files):
+                f_id = f["file_id"]
+                f_type = f.get("type", "document")
+                caption = f.get("caption") if idx == 0 else None
+                
+                if f_type == "photo":
+                    media.append(InputMediaPhoto(media=f_id, caption=caption))
+                elif f_type == "video":
+                    media.append(InputMediaVideo(media=f_id, caption=caption))
+                else:
+                    media.append(InputMediaDocument(media=f_id, caption=caption))
+            
+            sent_msgs = await bot.send_media_group(chat_id=GROUP_ID, media=media)
+            posted_ids = [m.message_id for m in sent_msgs]
+    except Exception as e:
+        logger.exception(f"Failed to send album: {e}")
+        return
+
+    try:
+        await published_col.insert_one({
+            "album_key": album_key,
+            "chat_id": GROUP_ID,
+            "message_ids": posted_ids,
+            "published_at": int(asyncio.get_event_loop().time())
+        })
+    except Exception:
+        pass
+
+    delay = await get_delete_seconds()
+    asyncio.create_task(_auto_delete_messages(GROUP_ID, posted_ids, delay))
+
+# ------------------ catch admin uploads in DM (MUST BE LAST) ------------------
+@dp.message(F.chat.type == "private")
+async def catch_private_uploads(message: Message):
+    user = message.from_user
+    if not is_admin(user.id):
+        return  # Silent for non-admins
+
+    mgid = getattr(message, "media_group_id", None)
+
+    # Determine file id, type, and caption
+    file_id = None
+    f_type = None
+    caption = message.caption or None
+    
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        f_type = "photo"
+    elif message.video:
+        file_id = message.video.file_id
+        f_type = "video"
+    elif message.document:
+        file_id = message.document.file_id
+        f_type = "document"
+    elif message.audio:
+        file_id = message.audio.file_id
+        f_type = "document"
+    elif message.animation:
+        file_id = message.animation.file_id
+        f_type = "document"
+
+    if mgid:
+        key = f"{user.id}:{mgid}"
+        if key not in _media_buffers:
+            _media_buffers[key] = {
+                "files": [], 
+                "chat_id": message.chat.id, 
+                "uploader": user.id, 
+                "timer": None
+            }
+        
+        if file_id:
+            _media_buffers[key]["files"].append({
+                "file_id": file_id, 
+                "type": f_type,
+                "caption": caption
+            })
+        
+        # Forward to DB channel
+        try:
+            await message.forward(chat_id=DB_CHANNEL_ID)
+        except Exception:
+            logger.warning("Forward to DB channel failed")
+        
+        # Reset timer
+        if _media_buffers[key].get("timer"):
+            _media_buffers[key]["timer"].cancel()
+        _schedule_finalize(key, delay=1.0)
+        return
+
+    # Single file (no media_group_id)
+    if file_id:
+        try:
+            await message.forward(chat_id=DB_CHANNEL_ID)
+        except Exception:
+            logger.warning("Forward single to DB channel failed")
+        
+        album_key = make_key()
+        doc = {
+            "album_key": album_key,
+            "file_ids": [{
+                "file_id": file_id, 
+                "type": f_type,
+                "caption": caption
+            }],
+            "uploader_id": user.id,
+            "created_at": int(asyncio.get_event_loop().time()),
+            "published": []
+        }
+        await albums_col.insert_one(doc)
+        
+        bot_username = (await bot.get_me()).username
+        link = f"https://t.me/{bot_username}?start={album_key}"
+        
+        try:
+            await message.answer(
+                f"✅ <b>Album saved successfully!</b>\n\n"
+                f"📁 <b>Album Key:</b> <code>{album_key}</code>\n"
+                f"🔗 <b>Direct Link:</b> {link}\n\n"
+                f"💡 <i>Share this link in the group!</i>"
+            )
+        except Exception:
+            logger.exception("Failed to notify admin for single album")
 
 # ------------------ startup ------------------
 async def on_startup():
