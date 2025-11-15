@@ -1,11 +1,12 @@
-# bot.py (FINAL)
+# bot.py (FIXED & IMPROVED)
 import os
 import asyncio
 import secrets
 import logging
 from typing import Dict, List
+from datetime import datetime
 
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message,
@@ -21,7 +22,10 @@ from dotenv import load_dotenv
 
 # ------------------ load env & logging ------------------
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -40,13 +44,13 @@ dp = Dispatcher()
 
 mongo = AsyncIOMotorClient(MONGO_URI)
 db = mongo["album_bot_v1"]
-albums_col = db["albums"]          # album docs: album_key, file_ids(list of {file_id,type}), uploader_id, created_at, published
-settings_col = db["settings"]      # global settings: mode, delete_seconds
-qualified_col = db["qualified"]    # { group_id: int, users: [uid,...] }
-published_col = db["published"]    # records of published albums
+albums_col = db["albums"]
+settings_col = db["settings"]
+qualified_col = db["qualified"]
+published_col = db["published"]
 
-# in-memory buffer to collect media groups while Telegram delivers them
-_media_buffers: Dict[str, Dict] = {}  # key -> {"files": [{"file_id":..., "type":...},...], "chat_id": int, "timer": Task, "uploader": uid}
+# in-memory buffer to collect media groups
+_media_buffers: Dict[str, Dict] = {}
 
 # ------------------ utilities ------------------
 def is_admin(uid: int) -> bool:
@@ -62,19 +66,28 @@ async def get_mode() -> str:
     return doc.get("mode", "peace")
 
 async def set_mode(mode: str):
-    await settings_col.update_one({"_id": "global"}, {"$set": {"mode": mode}}, upsert=True)
+    await settings_col.update_one(
+        {"_id": "global"}, 
+        {"$set": {"mode": mode}}, 
+        upsert=True
+    )
 
 async def get_delete_seconds() -> int:
     doc = await settings_col.find_one({"_id": "global"})
     if doc and "delete_seconds" in doc:
         return int(doc["delete_seconds"])
-    return 300
+    return 1800  # 30 minutes default
 
 async def set_delete_seconds(sec: int):
-    await settings_col.update_one({"_id": "global"}, {"$set": {"delete_seconds": int(sec)}}, upsert=True)
+    await settings_col.update_one(
+        {"_id": "global"}, 
+        {"$set": {"delete_seconds": int(sec)}}, 
+        upsert=True
+    )
 
 async def is_user_qualified(group_id: int, user_id: int) -> bool:
-    if await get_mode() == "peace":
+    mode = await get_mode()
+    if mode == "peace":
         return True
     doc = await qualified_col.find_one({"group_id": group_id})
     if not doc:
@@ -82,24 +95,40 @@ async def is_user_qualified(group_id: int, user_id: int) -> bool:
     return user_id in doc.get("users", [])
 
 async def add_qualified(group_id: int, user_id: int):
-    await qualified_col.update_one({"group_id": group_id}, {"$addToSet": {"users": user_id}}, upsert=True)
+    await qualified_col.update_one(
+        {"group_id": group_id}, 
+        {"$addToSet": {"users": user_id}}, 
+        upsert=True
+    )
 
 async def remove_qualified(group_id: int, user_id: int):
-    await qualified_col.update_one({"group_id": group_id}, {"$pull": {"users": user_id}})
+    await qualified_col.update_one(
+        {"group_id": group_id}, 
+        {"$pull": {"users": user_id}}
+    )
+
+async def get_qualified_users(group_id: int) -> List[int]:
+    doc = await qualified_col.find_one({"group_id": group_id})
+    return doc.get("users", []) if doc else []
 
 # ------------------ buffer finalize ------------------
 async def _finalize_buffer(key: str):
     entry = _media_buffers.pop(key, None)
     if not entry:
         return
+    
     files = entry.get("files", [])
     uploader = entry.get("uploader")
     chat_id = entry.get("chat_id")
+    
     if not files:
         return
 
+    if len(files) > 10:
+        logger.warning(f"Album has {len(files)} files, trimming to 10")
+        files = files[:10]
+
     album_key = make_key()
-    # store typed files (list of dicts)
     doc = {
         "album_key": album_key,
         "file_ids": files,
@@ -109,20 +138,29 @@ async def _finalize_buffer(key: str):
     }
     await albums_col.insert_one(doc)
 
-    # notify admin in DM
     try:
-        link = f"https://t.me/{(await bot.get_me()).username}?start={album_key}"
-        await bot.send_message(chat_id=chat_id,
-                               text=f"✅ Album saved.\nAlbum key: <code>{album_key}</code>\nLink: {link}\n\nUse `/publish {album_key}` in the group or paste the key in the group (bot will create a button).")
+        bot_username = (await bot.get_me()).username
+        link = f"https://t.me/{bot_username}?start={album_key}"
+        
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"✅ <b>Album saved successfully!</b>\n\n"
+                f"📁 <b>Album Key:</b> <code>{album_key}</code>\n"
+                f"🔗 <b>Direct Link:</b> {link}\n\n"
+                f"💡 <i>Share this link in the group, and it will be sent automatically!</i>"
+            )
+        )
     except Exception as e:
-        logger.exception("Failed to notify admin about album key: %s", e)
+        logger.exception(f"Failed to notify admin: {e}")
 
 def _schedule_finalize(key: str, delay: float = 1.0):
     async def _task():
         await asyncio.sleep(delay)
         await _finalize_buffer(key)
-    t = asyncio.create_task(_task())
-    _media_buffers[key]["timer"] = t
+    
+    task = asyncio.create_task(_task())
+    _media_buffers[key]["timer"] = task
 
 # ------------------ auto-delete ------------------
 async def _auto_delete_messages(chat_id: int, message_ids: List[int], delay: int):
@@ -137,8 +175,19 @@ async def _auto_delete_messages(chat_id: int, message_ids: List[int], delay: int
 @dp.message(CommandStart())
 async def on_start_with_payload(message: Message):
     args = (message.text or "").split(maxsplit=1)
+    
+    # No payload - welcome message for admins
     if len(args) == 1:
-        return await message.answer("Hi — this bot only sends albums inside the group. Please click album buttons in the group.")
+        if is_admin(message.from_user.id):
+            return await message.answer(
+                "👋 <b>Welcome Admin!</b>\n\n"
+                "📤 Send me media (photos/videos/documents) to create shareable albums.\n"
+                "🔗 I'll give you a link to share in your group!\n\n"
+                "Use /panel for admin commands."
+            )
+        else:
+            return  # Silent for non-admins
+    
     payload = args[1].strip()
     if "start=" in payload:
         payload = payload.split("start=", 1)[1].strip()
@@ -146,75 +195,77 @@ async def on_start_with_payload(message: Message):
 
     album = await albums_col.find_one({"album_key": album_key})
     if not album:
-        return await message.answer("This album link is invalid or expired.")
+        return  # Silent fail for invalid links
 
     if not await is_user_qualified(GROUP_ID, message.from_user.id):
-        return await message.answer("You are not allowed to open this album.")
+        return  # Silent fail for non-qualified users
 
     files = album.get("file_ids", [])
     if not files:
-        return await message.answer("Album has no files.")
+        return
 
-    # send
+    # Send album to group
     try:
         if len(files) == 1:
             f = files[0]
             f_id = f["file_id"]
             f_type = f.get("type", "document")
+            caption = f.get("caption")
+            
             if f_type == "photo":
-                sent = await bot.send_photo(chat_id=GROUP_ID, photo=f_id)
+                sent = await bot.send_photo(chat_id=GROUP_ID, photo=f_id, caption=caption)
             elif f_type == "video":
-                sent = await bot.send_video(chat_id=GROUP_ID, video=f_id)
+                sent = await bot.send_video(chat_id=GROUP_ID, video=f_id, caption=caption)
             else:
-                sent = await bot.send_document(chat_id=GROUP_ID, document=f_id)
+                sent = await bot.send_document(chat_id=GROUP_ID, document=f_id, caption=caption)
             posted_ids = [sent.message_id]
         else:
             media = []
-            for f in files:
+            for idx, f in enumerate(files):
                 f_id = f["file_id"]
                 f_type = f.get("type", "document")
+                caption = f.get("caption") if idx == 0 else None
+                
                 if f_type == "photo":
-                    media.append(InputMediaPhoto(media=f_id))
+                    media.append(InputMediaPhoto(media=f_id, caption=caption))
                 elif f_type == "video":
-                    media.append(InputMediaVideo(media=f_id))
+                    media.append(InputMediaVideo(media=f_id, caption=caption))
                 else:
-                    media.append(InputMediaDocument(media=f_id))
+                    media.append(InputMediaDocument(media=f_id, caption=caption))
+            
             sent_msgs = await bot.send_media_group(chat_id=GROUP_ID, media=media)
             posted_ids = [m.message_id for m in sent_msgs]
     except Exception as e:
-        await message.answer("Failed to deliver album to the group.")
-        logger.exception("Failed to send album from /start: %s", e)
+        logger.exception(f"Failed to send album: {e}")
         return
 
     try:
-        await published_col.insert_one({"album_key": album_key, "chat_id": GROUP_ID, "message_ids": posted_ids, "published_at": int(asyncio.get_event_loop().time())})
+        await published_col.insert_one({
+            "album_key": album_key,
+            "chat_id": GROUP_ID,
+            "message_ids": posted_ids,
+            "published_at": int(asyncio.get_event_loop().time())
+        })
     except Exception:
         pass
+
     delay = await get_delete_seconds()
     asyncio.create_task(_auto_delete_messages(GROUP_ID, posted_ids, delay))
 
-    try:
-        note = await message.answer("Album delivered to the group.")
-        await asyncio.sleep(1.5)
-        await note.delete()
-    except Exception:
-        pass
-
 # ------------------ catch admin uploads in DM ------------------
-@dp.message()
+@dp.message(F.chat.type == "private")
 async def catch_private_uploads(message: Message):
-    # only private and only admins
-    if message.chat.type != "private":
-        return
     user = message.from_user
     if not is_admin(user.id):
-        return
+        return  # Silent for non-admins
 
     mgid = getattr(message, "media_group_id", None)
 
-    # determine file id and type
+    # Determine file id, type, and caption
     file_id = None
     f_type = None
+    caption = message.caption or None
+    
     if message.photo:
         file_id = message.photo[-1].file_id
         f_type = "photo"
@@ -234,262 +285,306 @@ async def catch_private_uploads(message: Message):
     if mgid:
         key = f"{user.id}:{mgid}"
         if key not in _media_buffers:
-            _media_buffers[key] = {"files": [], "chat_id": message.chat.id, "uploader": user.id, "timer": None}
+            _media_buffers[key] = {
+                "files": [], 
+                "chat_id": message.chat.id, 
+                "uploader": user.id, 
+                "timer": None
+            }
+        
         if file_id:
-            _media_buffers[key]["files"].append({"file_id": file_id, "type": f_type})
-        # forward original to DB channel (archive)
+            _media_buffers[key]["files"].append({
+                "file_id": file_id, 
+                "type": f_type,
+                "caption": caption
+            })
+        
+        # Forward to DB channel
         try:
             await message.forward(chat_id=DB_CHANNEL_ID)
         except Exception:
-            logger.warning("Forward to DB channel failed.")
+            logger.warning("Forward to DB channel failed")
+        
+        # Reset timer
         if _media_buffers[key].get("timer"):
             _media_buffers[key]["timer"].cancel()
         _schedule_finalize(key, delay=1.0)
         return
 
-    # single file (no media_group_id)
+    # Single file (no media_group_id)
     if file_id:
         try:
             await message.forward(chat_id=DB_CHANNEL_ID)
         except Exception:
-            logger.warning("Forward single to DB channel failed.")
+            logger.warning("Forward single to DB channel failed")
+        
         album_key = make_key()
-        doc = {"album_key": album_key, "file_ids": [{"file_id": file_id, "type": f_type}], "uploader_id": user.id, "created_at": int(asyncio.get_event_loop().time()), "published": []}
+        doc = {
+            "album_key": album_key,
+            "file_ids": [{
+                "file_id": file_id, 
+                "type": f_type,
+                "caption": caption
+            }],
+            "uploader_id": user.id,
+            "created_at": int(asyncio.get_event_loop().time()),
+            "published": []
+        }
         await albums_col.insert_one(doc)
-        link = f"https://t.me/{(await bot.get_me()).username}?start={album_key}"
+        
+        bot_username = (await bot.get_me()).username
+        link = f"https://t.me/{bot_username}?start={album_key}"
+        
         try:
-            await message.answer(f"✅ Album saved.\nAlbum key: <code>{album_key}</code>\nLink: {link}\n\nUse `/publish {album_key}` in the group.")
+            await message.answer(
+                f"✅ <b>Album saved successfully!</b>\n\n"
+                f"📁 <b>Album Key:</b> <code>{album_key}</code>\n"
+                f"🔗 <b>Direct Link:</b> {link}\n\n"
+                f"💡 <i>Share this link in the group!</i>"
+            )
         except Exception:
-            logger.exception("Failed to notify admin for single album.")
-        return
+            logger.exception("Failed to notify admin for single album")
 
-    return
-
-# ------------------ publish command ------------------
-@dp.message(Command("publish"))
-async def cmd_publish(message: Message):
-    if message.chat.id != GROUP_ID:
-        return await message.reply("Please run this command inside the target group.")
+# ------------------ admin panel command ------------------
+@dp.message(Command("panel"))
+async def cmd_panel(message: Message):
     if not is_admin(message.from_user.id):
         return
-    parts = message.text.strip().split()
-    if len(parts) < 2:
-        return await message.reply("Usage: /publish <album_key>")
-    album_key = parts[1].strip()
-    album = await albums_col.find_one({"album_key": album_key})
-    if not album:
-        return await message.reply("Album key not found.")
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📁 Open Album", callback_data=f"open:{album_key}")]
-    ])
-    try:
-        await bot.send_message(chat_id=GROUP_ID, text="\u200b", reply_markup=kb)
-        await message.reply("Published album button to group.")
-    except Exception as e:
-        await message.reply(f"Failed to publish: {e}")
-
-# ------------------ detect paste in group ------------------
-@dp.message()
-async def detect_admin_paste_in_group(message: Message):
-    if message.chat.id != GROUP_ID:
-        return
-    if not is_admin(message.from_user.id):
-        return
-    text = (message.text or "").strip()
-    if not text:
-        return
-    candidate = text
-    if "start=" in text:
-        candidate = text.split("start=", 1)[1].split()[0].strip()
-    if len(candidate) < 6:
-        return
-    album = await albums_col.find_one({"album_key": candidate})
-    if not album:
-        return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📁 Open Album", callback_data=f"open:{candidate}")]
-    ])
-    try:
-        await bot.send_message(chat_id=GROUP_ID, text="\u200b", reply_markup=kb)
-        try:
-            await message.delete()
-        except:
-            pass
-    except Exception as e:
-        logger.exception("Failed to create album button: %s", e)
-
-# ------------------ callback handler for button clicks ------------------
-@dp.callback_query()
-async def cb_open_album(query: CallbackQuery):
-    data = query.data or ""
-    if not data.startswith("open:"):
-        return
-    album_key = data.split(":", 1)[1]
-    user = query.from_user
-    chat = query.message.chat
-    if chat.id != GROUP_ID:
-        await query.answer("This button is not valid here.", show_alert=False)
-        return
-    if not await is_user_qualified(chat.id, user.id):
-        await query.answer("You are not allowed to open this album.", show_alert=True)
-        return
-    album = await albums_col.find_one({"album_key": album_key})
-    if not album:
-        await query.answer("Album not found or expired.", show_alert=True)
-        return
-
-    files = album.get("file_ids", [])
-    if not files:
-        await query.answer("No files in album.", show_alert=True)
-        return
-
-    posted_ids: List[int] = []
-    try:
-        if len(files) == 1:
-            f = files[0]
-            f_id = f["file_id"]
-            f_type = f.get("type", "document")
-            if f_type == "photo":
-                sent = await bot.send_photo(chat_id=GROUP_ID, photo=f_id)
-            elif f_type == "video":
-                sent = await bot.send_video(chat_id=GROUP_ID, video=f_id)
-            else:
-                sent = await bot.send_document(chat_id=GROUP_ID, document=f_id)
-            posted_ids = [sent.message_id]
-        else:
-            media = []
-            for f in files:
-                f_id = f["file_id"]
-                f_type = f.get("type", "document")
-                if f_type == "photo":
-                    media.append(InputMediaPhoto(media=f_id))
-                elif f_type == "video":
-                    media.append(InputMediaVideo(media=f_id))
-                else:
-                    media.append(InputMediaDocument(media=f_id))
-            sent_msgs = await bot.send_media_group(chat_id=GROUP_ID, media=media)
-            posted_ids = [m.message_id for m in sent_msgs]
-    except Exception as e:
-        logger.exception("Failed to send album to group: %s", e)
-        await query.answer("Failed to deliver album.", show_alert=True)
-        return
-
-    try:
-        await published_col.insert_one({"album_key": album_key, "chat_id": GROUP_ID, "message_ids": posted_ids, "published_at": int(asyncio.get_event_loop().time())})
-    except Exception:
-        pass
-
-    delay = await get_delete_seconds()
-    asyncio.create_task(_auto_delete_messages(GROUP_ID, posted_ids, delay))
-    await query.answer()
+    
+    mode = await get_mode()
+    delete_time = await get_delete_seconds()
+    qualified_users = await get_qualified_users(GROUP_ID)
+    
+    mode_status = "🔒 <b>WHITELIST MODE</b>" if mode == "qualified" else "🌍 <b>PEACE MODE</b>"
+    
+    panel_text = (
+        "⚙️ <b>ADMIN CONTROL PANEL</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 <b>Current Status:</b>\n"
+        f"   • Mode: {mode_status}\n"
+        f"   • Auto-delete: {delete_time} seconds ({delete_time//60} minutes)\n"
+        f"   • Qualified users: {len(qualified_users)}\n\n"
+        "📝 <b>Available Commands:</b>\n\n"
+        "<b>Protection Mode:</b>\n"
+        "   /mode_on - Enable whitelist (only allowed users)\n"
+        "   /mode_off - Disable whitelist (everyone can access)\n\n"
+        "<b>User Management:</b>\n"
+        "   /allow [reply to user] - Add user to whitelist\n"
+        "   /disallow [reply to user] - Remove user from whitelist\n"
+        "   /list_allowed - Show all whitelisted users\n\n"
+        "<b>Settings:</b>\n"
+        "   /set_delete_time [seconds] - Set auto-delete timer\n"
+        "   /panel - Show this panel\n\n"
+        "💡 <b>Tip:</b> Reply to any user's message with /allow or /disallow"
+    )
+    
+    await message.answer(panel_text)
 
 # ------------------ admin commands ------------------
 @dp.message(Command("mode_on"))
 async def cmd_mode_on(msg: Message):
     if not is_admin(msg.from_user.id):
         return
+    
     await set_mode("qualified")
-    await msg.reply("Qualified-user mode is now ON (whitelist only).")
+    await msg.reply(
+        "🔒 <b>WHITELIST MODE ENABLED</b>\n\n"
+        "Only users in the whitelist can now open album links.\n"
+        "Use /allow to add users."
+    )
 
 @dp.message(Command("mode_off"))
 async def cmd_mode_off(msg: Message):
     if not is_admin(msg.from_user.id):
         return
+    
     await set_mode("peace")
-    await msg.reply("Peace mode is now ON (anyone can open links).")
+    await msg.reply(
+        "🌍 <b>PEACE MODE ENABLED</b>\n\n"
+        "Everyone in the group can now open album links."
+    )
 
 @dp.message(Command("allow"))
 async def cmd_allow(msg: Message):
     if not is_admin(msg.from_user.id):
         return
+    
     target = None
+    target_name = None
+    
     if msg.reply_to_message:
         target = msg.reply_to_message.from_user.id
+        target_name = msg.reply_to_message.from_user.full_name
     else:
         parts = msg.text.split()
         if len(parts) < 2:
-            return await msg.reply("Usage: /allow @username or reply to a user's message.")
+            return await msg.reply(
+                "❌ <b>Usage:</b>\n"
+                "Reply to a user's message with /allow\n"
+                "OR\n"
+                "/allow @username\n"
+                "/allow user_id"
+            )
+        
         ident = parts[1].strip()
         if ident.startswith("@"):
             try:
                 user = await bot.get_chat(ident)
                 target = user.id
+                target_name = user.full_name or ident
             except Exception:
-                return await msg.reply("Cannot resolve username.")
+                return await msg.reply("❌ Cannot find this username.")
         else:
             try:
                 target = int(ident)
+                target_name = f"User {target}"
             except Exception:
-                return await msg.reply("Provide numeric user id or @username.")
+                return await msg.reply("❌ Invalid user ID.")
+    
     if not target:
         return
+    
     await add_qualified(msg.chat.id, target)
-    await msg.reply(f"User <code>{target}</code> allowed.")
+    await msg.reply(
+        f"✅ <b>User Added to Whitelist</b>\n\n"
+        f"👤 {target_name}\n"
+        f"🆔 <code>{target}</code>\n\n"
+        f"This user can now open album links."
+    )
 
 @dp.message(Command("disallow"))
 async def cmd_disallow(msg: Message):
     if not is_admin(msg.from_user.id):
         return
-    parts = msg.text.split()
-    if len(parts) < 2 and not msg.reply_to_message:
-        return await msg.reply("Usage: /disallow @username or reply to user's message.")
+    
     target = None
+    target_name = None
+    
     if msg.reply_to_message:
         target = msg.reply_to_message.from_user.id
+        target_name = msg.reply_to_message.from_user.full_name
     else:
+        parts = msg.text.split()
+        if len(parts) < 2:
+            return await msg.reply(
+                "❌ <b>Usage:</b>\n"
+                "Reply to a user's message with /disallow\n"
+                "OR\n"
+                "/disallow @username\n"
+                "/disallow user_id"
+            )
+        
         ident = parts[1].strip()
         if ident.startswith("@"):
             try:
                 user = await bot.get_chat(ident)
                 target = user.id
+                target_name = user.full_name or ident
             except Exception:
-                return await msg.reply("Cannot resolve username.")
+                return await msg.reply("❌ Cannot find this username.")
         else:
             try:
                 target = int(ident)
+                target_name = f"User {target}"
             except Exception:
-                return await msg.reply("Provide numeric user id or @username.")
+                return await msg.reply("❌ Invalid user ID.")
+    
+    if not target:
+        return
+    
     await remove_qualified(msg.chat.id, target)
-    await msg.reply(f"User <code>{target}</code> removed from allowed list.")
+    await msg.reply(
+        f"🚫 <b>User Removed from Whitelist</b>\n\n"
+        f"👤 {target_name}\n"
+        f"🆔 <code>{target}</code>\n\n"
+        f"This user can no longer open album links."
+    )
 
 @dp.message(Command("list_allowed"))
 async def cmd_list_allowed(msg: Message):
     if not is_admin(msg.from_user.id):
         return
-    doc = await qualified_col.find_one({"group_id": msg.chat.id})
-    users = doc.get("users", []) if doc else []
+    
+    users = await get_qualified_users(msg.chat.id)
+    
     if not users:
-        return await msg.reply("No qualified users configured.")
-    text = "Qualified user IDs:\n" + "\n".join(str(u) for u in users)
-    await msg.reply(text)
+        return await msg.reply(
+            "📋 <b>Whitelist is Empty</b>\n\n"
+            "No users have been added yet.\n"
+            "Use /allow to add users."
+        )
+    
+    user_list = "\n".join([f"   • <code>{uid}</code>" for uid in users])
+    
+    await msg.reply(
+        f"📋 <b>Whitelisted Users</b>\n\n"
+        f"Total: {len(users)} users\n\n"
+        f"{user_list}\n\n"
+        f"💡 Use /disallow to remove users"
+    )
 
 @dp.message(Command("set_delete_time"))
 async def cmd_set_delete_time(msg: Message):
     if not is_admin(msg.from_user.id):
         return
+    
     parts = msg.text.strip().split()
     if len(parts) < 2:
-        return await msg.reply("Usage: /set_delete_time <seconds>")
+        current = await get_delete_seconds()
+        return await msg.reply(
+            f"⏱ <b>Current Auto-Delete Time:</b> {current} seconds ({current//60} minutes)\n\n"
+            f"<b>Usage:</b> /set_delete_time [seconds]\n\n"
+            f"<b>Examples:</b>\n"
+            f"   /set_delete_time 300 (5 minutes)\n"
+            f"   /set_delete_time 1800 (30 minutes)\n"
+            f"   /set_delete_time 3600 (1 hour)"
+        )
+    
     try:
-        s = int(parts[1])
-        if s < 5:
-            return await msg.reply("Minimum is 5 seconds.")
-        await set_delete_seconds(s)
-        await msg.reply(f"Global delete time set to {s} seconds.")
+        seconds = int(parts[1])
+        if seconds < 5:
+            return await msg.reply("❌ Minimum is 5 seconds.")
+        
+        await set_delete_seconds(seconds)
+        minutes = seconds // 60
+        await msg.reply(
+            f"✅ <b>Auto-Delete Time Updated</b>\n\n"
+            f"⏱ New timer: {seconds} seconds ({minutes} minutes)\n\n"
+            f"All new albums will auto-delete after this time."
+        )
     except Exception:
-        return await msg.reply("Invalid number.")
+        return await msg.reply("❌ Invalid number. Use whole numbers only.")
 
 # ------------------ startup ------------------
 async def on_startup():
-    await settings_col.update_one({"_id": "global"}, {"$setOnInsert": {"mode": "peace", "delete_seconds": 300}}, upsert=True)
-    logger.info("Bot started and ready.")
+    await settings_col.update_one(
+        {"_id": "global"},
+        {"$setOnInsert": {"mode": "peace", "delete_seconds": 1800}},
+        upsert=True
+    )
+    logger.info("✅ Bot started successfully")
+    logger.info(f"📊 Admins: {ADMINS}")
+    logger.info(f"📁 DB Channel: {DB_CHANNEL_ID}")
+    logger.info(f"👥 Group: {GROUP_ID}")
+
+async def on_shutdown():
+    logger.info("🛑 Bot shutting down...")
+    await mongo.close()
 
 if __name__ == "__main__":
     dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+    
     try:
+        logger.info("🚀 Starting bot...")
         dp.run_polling(bot)
+    except KeyboardInterrupt:
+        logger.info("⚠️ Bot stopped by user")
+    except Exception as e:
+        logger.error(f"❌ Fatal error: {e}")
     finally:
         asyncio.run(bot.session.close())
+
 
 
 
