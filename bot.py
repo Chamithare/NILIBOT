@@ -465,6 +465,21 @@ async def on_start_with_payload(message: Message):
 
     delay = await get_delete_seconds()
     asyncio.create_task(_auto_delete_messages(GROUP_ID, posted_ids, delay))
+    
+    # Send confirmation to user that auto-deletes
+    try:
+        minutes = delay // 60
+        confirmation = await message.answer(
+            f"✅ <b>Album sent to group!</b>\n\n"
+            f"📁 {len(files)} file(s) delivered\n"
+            f"⏱ Will auto-delete in {minutes} minutes\n\n"
+            f"You can close this chat now."
+        )
+        # Delete confirmation after 5 seconds
+        await asyncio.sleep(5)
+        await confirmation.delete()
+    except Exception:
+        pass
 
 # ------------------ catch admin uploads in DM (MUST BE LAST) ------------------
 @dp.message(F.chat.type == "private")
@@ -588,7 +603,6 @@ if __name__ == "__main__":
         logger.error(f"❌ Fatal error: {e}")
     finally:
         asyncio.run(bot.session.close())
-
 
 
 
