@@ -21,15 +21,36 @@ dp = Dispatcher()
 # --------------------------
 # START HANDLER (ADMIN ONLY)
 # --------------------------
-@dp.message(CommandStart())
-async def start_cmd(message: Message):
-    if message.from_user.id != ADMIN_IDS:
-        return await message.answer("This bot only accepts albums from the admin.")
+@router.message(CommandStart(deep_link=True))
+async def start_with_payload(message: Message, command: CommandStart):
+    payload = command.args
 
-    await message.answer(
-        "<b>Send me any album (photos/videos/documents)</b>\n\n"
-        "I will save it and give you a publish link."
-    )
+    if not payload:
+        await message.answer("No album key provided.")
+        return
+
+    # retrieve album
+    album = await get_album(payload)
+    if not album:
+        await message.answer("Album not found.")
+        return
+
+    file_ids = album["file_ids"]
+
+    try:
+        if len(file_ids) == 1:
+            sent = await bot.send_document(chat_id=GROUP_ID, document=file_ids[0])
+            posted_ids = [sent.message_id]
+        else:
+            media = [InputMediaDocument(media=fid) for fid in file_ids]
+            sent_msgs = await bot.send_media_group(chat_id=GROUP_ID, media=media)
+            posted_ids = [m.message_id for m in sent_msgs]
+
+        await message.answer("Album delivered to the group.")
+    except Exception as e:
+        logger.exception("Failed to send album:", e)
+        await message.answer("Failed to deliver album to the group.")
+
 
 
 # --------------------------
@@ -167,6 +188,7 @@ if __name__ == "__main__":
     import asyncio
 
     asyncio.run(main())
+
 
 
 
