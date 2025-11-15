@@ -1,68 +1,76 @@
-import os
+import logging
 import asyncio
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, InputMediaDocument
+from aiogram import Bot, Router, F
+from aiogram.types import Message, InputMediaPhoto, InputMediaDocument
 from aiogram.filters import CommandStart
-from aiogram.fsm.storage.memory import MemoryStorage
+from config import BOT_TOKEN, GROUP_ID, DB_CHANNEL_ID, ADMIN_IDS
+from db import save_album, get_album
 
-from db import get_album  # your async DB function to get album by key
-from config import BOT_TOKEN, GROUP_ID, ADMIN_IDS  # ADMIN_IDS as list of ints
+logging.basicConfig(level=logging.INFO)
 
-# --- Bot and Dispatcher ---
-bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 router = Router()
-dp.include_router(router)
 
-# --- Start command with deep link ---
+async def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
 @router.message(CommandStart(deep_link=True))
-async def start_with_payload(message: Message, command: CommandStart):
-    payload = command.args  # deep link payload
+async def start_with_payload(message: Message):
     user_id = message.from_user.id
-
-    if user_id not in ADMIN_IDS:
-        await message.answer("⛔ You are not authorized.")
+    if not await is_admin(user_id):
+        await message.reply("You are not authorized to use this bot.")
         return
 
-    if not payload:
-        await message.answer("⚠️ No album key provided in link.")
-        return
-
-    album = await get_album(payload)
-    if not album or not album.get("file_ids"):
-        await message.answer("❌ Album not found or empty.")
-        return
-
-    file_ids = album["file_ids"]
+    # Example album: Replace with your real media
+    media_files = [
+        InputMediaPhoto(media="https://picsum.photos/200/300"),
+        InputMediaPhoto(media="https://picsum.photos/300/300")
+    ]
 
     try:
-        # Single file
-        if len(file_ids) == 1:
-            sent = await bot.send_document(chat_id=GROUP_ID, document=file_ids[0])
-            posted_ids = [sent.message_id]
-        # Multiple files
-        else:
-            media = [InputMediaDocument(media=fid) for fid in file_ids]
-            sent_msgs = await bot.send_media_group(chat_id=GROUP_ID, media=media)
-            posted_ids = [m.message_id for m in sent_msgs]
-
-        await message.answer(f"✅ Album delivered to the group ({len(posted_ids)} files).")
+        sent = await bot.send_media_group(chat_id=DB_CHANNEL_ID, media=media_files)
+        # Save album to DB
+        await save_album(sent[0].media_group_id, [m.file_id for m in sent])
+        await message.reply("Album successfully sent to DB channel!")
     except Exception as e:
-        await message.answer("❌ Failed to deliver album to the group.")
-        print("Error sending album:", e)
+        logging.exception("Failed to send album to DB channel")
+        await message.reply(f"FAILED TO DELIVER ALBUM: {e}")
 
-# --- Optional: simple hi reply for admins ---
-@router.message(F.text.lower() == "hi")
-async def hi_reply(message: Message):
-    if message.from_user.id in ADMIN_IDS:
-        await message.answer(f"Hello admin 👋")
-    else:
-        await message.answer("Hello!")
+@router.message(F.text.lower() == "send album")
+async def forward_album(message: Message):
+    user_id = message.from_user.id
+    if not await is_admin(user_id):
+        await message.reply("You are not authorized to use this command.")
+        return
 
-# --- Run bot ---
+    # Example: Forward last album from DB channel to target group
+    # Replace "last_album_id" with real logic to get which album to forward
+    last_album_id = "example_album"
+    media_file_ids = await get_album(last_album_id)
+    if not media_file_ids:
+        await message.reply("No album found in DB channel.")
+        return
+
+    media = [InputMediaPhoto(file_id) for file_id in media_file_ids]
+
+    try:
+        await bot.send_media_group(chat_id=GROUP_ID, media=media)
+        await message.reply("Album forwarded to target group!")
+    except Exception as e:
+        logging.exception("Failed to forward album")
+        await message.reply(f"FAILED TO FORWARD ALBUM: {e}")
+
+async def main():
+    router.include_router(router)
+    from aiogram import Dispatcher
+    dp = Dispatcher()
+    dp.include_router(router)
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
-    asyncio.run(dp.start_polling(bot))
+    asyncio.run(main())
+
+
 
 
 
