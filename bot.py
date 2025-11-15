@@ -51,6 +51,70 @@ published_col = db["published"]    # records of published albums
 # in-memory buffer to collect media groups while Telegram delivers them
 _media_buffers: Dict[str, Dict] = {}  # key -> {"files": [file_id,...], "chat_id": int, "timer": Task, "uploader": uid}
 
+# handle deep-link clicks: user clicks t.me/YourBot?start=ALBUMKEY -> Telegram opens DM and sends /start ALBUMKEY
+from aiogram.filters import CommandStart
+
+@dp.message(CommandStart())
+async def on_start_with_payload(message: Message):
+    # If user opened bot without payload => simple greeting
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) == 1:
+        # plain /start without payload
+        return await message.answer("Hi — this bot only sends albums inside the group. Please click album buttons in the group.")
+    payload = args[1].strip()
+
+    # payload might be full URL if user pasted link and clicked it; extract if needed
+    if "start=" in payload:
+        payload = payload.split("start=", 1)[1].strip()
+
+    album_key = payload
+
+    # fetch album from DB
+    album = await albums_col.find_one({"album_key": album_key})
+    if not album:
+        return await message.answer("This album link is invalid or expired.")
+
+    # check mode & whitelist
+    if not await is_user_qualified(GROUP_ID, message.from_user.id):
+        # user clicked link but is not allowed
+        return await message.answer("You are not allowed to open this album.")
+
+    file_ids = album.get("file_ids", [])
+    if not file_ids:
+        return await message.answer("Album has no files.")
+
+    # Send the album into the GROUP (your specified GROUP_ID)
+    try:
+        if len(file_ids) == 1:
+            # single file
+            sent = await bot.send_document(chat_id=GROUP_ID, document=file_ids[0])
+            posted_ids = [sent.message_id]
+        else:
+            # use InputMediaDocument for mixed types (reliable)
+            media = [InputMediaDocument(media=fid) for fid in file_ids]
+            sent_msgs = await bot.send_media_group(chat_id=GROUP_ID, media=media)
+            posted_ids = [m.message_id for m in sent_msgs]
+    except Exception as e:
+        await message.answer("Failed to deliver album to the group.")
+        logger.exception("Failed to send album from /start: %s", e)
+        return
+
+    # record published and schedule auto-delete (reuse existing logic)
+    try:
+        await published_col.insert_one({"album_key": album_key, "chat_id": GROUP_ID, "message_ids": posted_ids, "published_at": int(asyncio.get_event_loop().time())})
+    except Exception:
+        pass
+    delay = await get_delete_seconds()
+    asyncio.create_task(_auto_delete_messages(GROUP_ID, posted_ids, delay))
+
+    # Optionally confirm quietly to the user (we'll send a short message then delete it)
+    try:
+        note = await message.answer("Album delivered to the group.")
+        await asyncio.sleep(2)
+        await note.delete()
+    except Exception:
+        pass
+
 # ----------------- utilities -----------------
 def is_admin(uid: int) -> bool:
     return uid in ADMINS
@@ -226,29 +290,39 @@ async def cmd_publish(message: Message):
 
 @dp.message()
 async def detect_admin_paste_in_group(message: Message):
-    """If an admin pastes an album key directly in the group, convert it into a button post (for convenience)."""
     if message.chat.id != GROUP_ID:
         return
     if not is_admin(message.from_user.id):
         return
-    # simple heuristics: album keys are base64-url like (token_urlsafe 8), check length & allowed chars
-    candidate = message.text.strip() if message.text else ""
-    if not candidate:
+
+    text = (message.text or "").strip()
+    if not text:
         return
-    # check if this candidate exists as album_key
+
+    candidate = text
+    if "start=" in text:
+        candidate = text.split("start=", 1)[1].split()[0].strip()
+
+    if len(candidate) < 6:
+        return
+
     album = await albums_col.find_one({"album_key": candidate})
     if not album:
         return
-    # create inline button below (bot will send its own message)
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📁 Open Album", callback_data=f"open:{candidate}")]
     ])
+
     try:
         await bot.send_message(chat_id=GROUP_ID, text="\u200b", reply_markup=kb)
-        # optionally remove the admin's raw key text to keep chat clean — commented out
-        # await message.delete()
+        try:
+            await message.delete()
+        except:
+            pass
     except Exception as e:
-        logger.exception("Failed to create button from pasted key: %s", e)
+        logger.exception("Failed to create album button: %s", e)
+
 
 # ----------------- callback handler for button clicks -----------------
 
@@ -433,3 +507,5 @@ if __name__ == "__main__":
         dp.run_polling(bot)
     finally:
         asyncio.run(bot.session.close())
+
+
