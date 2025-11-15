@@ -1,3 +1,0 @@
-aiogram==3.4.1
-motor==3.3.2
-python-dotenv==1.0.0
