@@ -7,7 +7,7 @@ from aiogram.types import (
     InputMediaDocument,
 )
 from aiogram.filters import CommandStart, Command
-from config import BOT_TOKEN, GROUP_ID, ADMIN_ID
+from config import BOT_TOKEN, GROUP_ID, ADMIN_IDS
 from db import get_album, save_album
 from album_utils import extract_file_ids
 
@@ -23,7 +23,7 @@ dp = Dispatcher()
 # --------------------------
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
-    if message.from_user.id != ADMIN_ID:
+    if message.from_user.id != ADMIN_IDS:
         return await message.answer("This bot only accepts albums from the admin.")
 
     await message.answer(
@@ -122,7 +122,7 @@ async def start_with_payload(message: Message, command: CommandStart.CommandArgs
 # --------------------------
 @dp.message(Command("publish"))
 async def manual_publish(message: Message):
-    if message.from_user.id != ADMIN_ID:
+    if message.from_user.id != ADMIN_IDS:
         return
 
     parts = message.text.split()
@@ -167,5 +167,6 @@ if __name__ == "__main__":
     import asyncio
 
     asyncio.run(main())
+
 
 
