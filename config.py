@@ -1,11 +1,17 @@
 import os
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_ID = os.getenv("GROUP_ID")
-DB_CHANNEL_ID = os.getenv("DB_CHANNEL_ID")
+# Telegram bot token
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
-# Multiple admins support
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+# Default channel/group ID where albums are stored (DB channel)
+DB_CHANNEL_ID = int(os.getenv("DB_CHANNEL_ID", 0))
+
+# Admin IDs (comma-separated in ENV)
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+
+# Optional: default parse mode
+PARSE_MODE = "HTML"
+
 
 
 
