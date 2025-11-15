@@ -1,91 +1,72 @@
+import os
 import asyncio
-import logging
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InputMediaPhoto, InputMediaDocument
+from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
-from config import BOT_TOKEN, GROUP_ID, ADMIN_IDS, DB_CHANNEL_ID
+from aiogram.types import InputMediaPhoto, InputMediaDocument
 from db import get_album, save_album  # Your DB functions
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# --- CONFIG ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROUP_ID = int(os.getenv("GROUP_ID"))
+DB_CHANNEL_ID = int(os.getenv("DB_CHANNEL_ID"))
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 
-# Bot initialization
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
-
-# Dispatcher
+# --- INIT BOT ---
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Helper: Check admin
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-# Command /start with deep link (admin only)
-@dp.message(CommandStart(deep_link=True))
-async def start_with_payload(message: Message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        await message.reply("❌ You are not authorized to use this bot.")
-        return
-
-    # Get deep-link payload (album key)
-    payload = message.get_args()
-    logger.info(f"Admin {user_id} started with payload: {payload}")
-
-    album = await get_album(payload)
-    if not album:
-        await message.reply("❌ Album not found.")
-        return
-
-    media = []
-    for item in album["files"]:
-        f_id = item.get("file_id")
-        f_type = item.get("type", "document")
-        if f_type == "photo":
-            media.append(InputMediaPhoto(media=f_id))
-        else:
-            media.append(InputMediaDocument(media=f_id))
-
+# --- HELPERS ---
+async def send_album_to_group(media, chat_id):
     try:
-        if len(media) == 1:
-            msg = await bot.send_photo(chat_id=GROUP_ID, photo=media[0].media)
-        else:
-            msgs = await bot.send_media_group(chat_id=GROUP_ID, media=media)
-        await message.reply("✅ Album delivered to the group.")
+        return await bot.send_media_group(chat_id=chat_id, media=media)
     except Exception as e:
-        logger.exception("Failed to send album", exc_info=e)
-        await message.reply(f"❌ Failed to deliver album: {e}")
+        print(f"Failed to send album to {chat_id}: {e}")
+        return None
 
-# Example admin command to save an album (needs to be adapted for how you want to save)
-@dp.message(F.text.startswith("/savealbum"))
-async def save_album_cmd(message: Message):
+# --- HANDLERS ---
+@dp.message(CommandStart(deep_link=True))
+async def start_with_payload(message: types.Message, command: CommandStart):
     user_id = message.from_user.id
-    if not is_admin(user_id):
+
+    if user_id not in ADMIN_IDS:
+        await message.reply("❌ You are not allowed to use this bot.")
         return
 
-    # Placeholder: you need to gather media first
-    # For example: message.reply with files ids or something
-    await save_album("SOME_ALBUM_ID", [])
-    await message.reply("✅ (Stub) Album saved to DB!")
+    payload = command.payload
+    await message.reply(f"👋 Hello Admin!\nPayload: {payload}")
 
-# Run polling
+    # --- Example: fetch album from DB ---
+    album_data = await get_album(payload)
+    if not album_data:
+        await message.reply("⚠️ No album found in DB for this payload.")
+        return
+
+    media_group = []
+    for item in album_data:
+        if item['type'] == 'photo':
+            media_group.append(InputMediaPhoto(media=item['file_id']))
+        elif item['type'] == 'document':
+            media_group.append(InputMediaDocument(media=item['file_id']))
+
+    result = await send_album_to_group(media_group, GROUP_ID)
+    if result:
+        await message.reply("✅ Album sent successfully to group.")
+    else:
+        await message.reply("❌ Failed to deliver album to group.")
+
+# --- COMMAND /start without payload ---
+@dp.message(CommandStart())
+async def start(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in ADMIN_IDS:
+        await message.reply("❌ You are not allowed to use this bot.")
+        return
+    await message.reply("👋 Hello Admin! Use a deep link to send an album.")
+
+# --- MAIN ---
 async def main():
-    try:
-        logger.info("Bot starting …")
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
+    print("🚀 Bot starting…")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
-
-
-
-
-
-
-
