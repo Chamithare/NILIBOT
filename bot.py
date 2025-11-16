@@ -85,6 +85,38 @@ async def set_delete_seconds(sec: int):
         upsert=True
     )
 
+async def is_force_sub_enabled() -> bool:
+    doc = await settings_col.find_one({"_id": "global"})
+    if not doc:
+        return False
+    return doc.get("force_sub_enabled", False)
+
+async def get_force_sub_channel() -> int:
+    doc = await settings_col.find_one({"_id": "global"})
+    if not doc:
+        return 0
+    return doc.get("force_sub_channel_id", 0)
+
+async def set_force_sub(enabled: bool, channel_id: int = 0):
+    await settings_col.update_one(
+        {"_id": "global"},
+        {"$set": {
+            "force_sub_enabled": enabled,
+            "force_sub_channel_id": channel_id
+        }},
+        upsert=True
+    )
+
+async def check_user_subscription(user_id: int, channel_id: int) -> bool:
+    """Check if user is subscribed to the force-sub channel"""
+    try:
+        member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+        # member.status can be: creator, administrator, member, restricted, left, kicked
+        return member.status in ["creator", "administrator", "member"]
+    except Exception as e:
+        logger.warning(f"Failed to check subscription for user {user_id}: {e}")
+        return False  # If check fails, deny access
+
 async def is_user_qualified(group_id: int, user_id: int) -> bool:
     mode = await get_mode()
     if mode == "peace":
@@ -181,20 +213,38 @@ async def cmd_panel(message: Message):
         mode = await get_mode()
         delete_time = await get_delete_seconds()
         qualified_users = await get_qualified_users(GROUP_ID)
+        force_sub_enabled = await is_force_sub_enabled()
+        force_sub_channel = await get_force_sub_channel()
         
         mode_status = "🔒 <b>WHITELIST MODE</b>" if mode == "qualified" else "🌍 <b>PEACE MODE</b>"
+        force_sub_status = "✅ <b>ENABLED</b>" if force_sub_enabled else "❌ <b>DISABLED</b>"
+        
+        # Get channel info if force sub is enabled
+        channel_info = ""
+        if force_sub_enabled and force_sub_channel != 0:
+            try:
+                channel = await bot.get_chat(force_sub_channel)
+                channel_name = f"@{channel.username}" if channel.username else channel.title
+                channel_info = f"\n   • Channel: {channel_name}"
+            except:
+                channel_info = f"\n   • Channel ID: <code>{force_sub_channel}</code>"
         
         panel_text = (
             "⚙️ <b>ADMIN CONTROL PANEL</b>\n"
             "━━━━━━━━━━━━━━━━━━━\n\n"
             f"📊 <b>Current Status:</b>\n"
             f"   • Mode: {mode_status}\n"
+            f"   • Force Subscribe: {force_sub_status}{channel_info}\n"
             f"   • Auto-delete: {delete_time} seconds ({delete_time//60} minutes)\n"
             f"   • Qualified users: {len(qualified_users)}\n\n"
             "📝 <b>Available Commands:</b>\n\n"
             "<b>Protection Mode:</b>\n"
             "   /mode_on - Enable whitelist (only allowed users)\n"
             "   /mode_off - Disable whitelist (everyone can access)\n\n"
+            "<b>Force Subscribe:</b>\n"
+            "   /force_sub_on [channel_id] - Enable force subscribe\n"
+            "   /force_sub_off - Disable force subscribe\n"
+            "   /force_sub_status - Check force sub status\n\n"
             "<b>User Management:</b>\n"
             "   /allow [reply to user] - Add user to whitelist\n"
             "   /disallow [reply to user] - Remove user from whitelist\n"
@@ -202,7 +252,7 @@ async def cmd_panel(message: Message):
             "<b>Settings:</b>\n"
             "   /set_delete_time [seconds] - Set auto-delete timer\n"
             "   /panel - Show this panel\n\n"
-            "💡 <b>Tip:</b> Reply to any user's message with /allow or /disallow"
+            "💡 <b>Tip:</b> Make bot admin in your force-sub channel!"
         )
         
         await message.answer(panel_text)
@@ -385,6 +435,95 @@ async def cmd_set_delete_time(msg: Message):
     except Exception:
         return await msg.reply("❌ Invalid number. Use whole numbers only.")
 
+# ------------------ force subscribe commands ------------------
+@dp.message(Command("force_sub_on"))
+async def cmd_force_sub_on(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    
+    parts = msg.text.strip().split()
+    if len(parts) < 2:
+        return await msg.reply(
+            "❌ <b>Usage:</b> /force_sub_on [channel_id]\n\n"
+            "<b>How to get channel ID:</b>\n"
+            "1. Forward a message from your channel to @userinfobot\n"
+            "2. Bot will show the channel ID (e.g., -1001234567890)\n"
+            "3. Use that ID: /force_sub_on -1001234567890\n\n"
+            "⚠️ <b>Important:</b> Make sure the bot is admin in your channel!"
+        )
+    
+    try:
+        channel_id = int(parts[1])
+        
+        # Try to get channel info to verify bot has access
+        try:
+            channel = await bot.get_chat(channel_id)
+            channel_name = f"@{channel.username}" if channel.username else channel.title
+        except Exception as e:
+            return await msg.reply(
+                f"❌ <b>Cannot access channel!</b>\n\n"
+                f"Make sure:\n"
+                f"1. The channel ID is correct\n"
+                f"2. Bot is added as admin in the channel\n\n"
+                f"Error: {str(e)}"
+            )
+        
+        await set_force_sub(enabled=True, channel_id=channel_id)
+        
+        await msg.reply(
+            f"✅ <b>Force Subscribe ENABLED</b>\n\n"
+            f"📢 Channel: {channel_name}\n"
+            f"🆔 ID: <code>{channel_id}</code>\n\n"
+            f"Now all users must subscribe to this channel to access albums!"
+        )
+    except ValueError:
+        return await msg.reply("❌ Invalid channel ID. Must be a number (e.g., -1001234567890)")
+    except Exception as e:
+        return await msg.reply(f"❌ Error: {str(e)}")
+
+@dp.message(Command("force_sub_off"))
+async def cmd_force_sub_off(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    
+    await set_force_sub(enabled=False)
+    await msg.reply(
+        "❌ <b>Force Subscribe DISABLED</b>\n\n"
+        "Users can now access albums without subscribing to any channel."
+    )
+
+@dp.message(Command("force_sub_status"))
+async def cmd_force_sub_status(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    
+    enabled = await is_force_sub_enabled()
+    channel_id = await get_force_sub_channel()
+    
+    if not enabled:
+        return await msg.reply(
+            "📊 <b>Force Subscribe Status</b>\n\n"
+            "Status: ❌ <b>DISABLED</b>\n\n"
+            "Use /force_sub_on [channel_id] to enable it."
+        )
+    
+    # Get channel info
+    channel_info = f"Channel ID: <code>{channel_id}</code>"
+    if channel_id != 0:
+        try:
+            channel = await bot.get_chat(channel_id)
+            channel_name = f"@{channel.username}" if channel.username else channel.title
+            channel_info = f"Channel: {channel_name}\nID: <code>{channel_id}</code>"
+        except:
+            pass
+    
+    await msg.reply(
+        f"📊 <b>Force Subscribe Status</b>\n\n"
+        f"Status: ✅ <b>ENABLED</b>\n"
+        f"{channel_info}\n\n"
+        f"All users must subscribe to access albums."
+    )
+
 # ------------------ start handler (deep-link) ------------------
 @dp.message(CommandStart())
 async def on_start_with_payload(message: Message):
@@ -411,8 +550,43 @@ async def on_start_with_payload(message: Message):
     if not album:
         return  # Silent fail for invalid links
 
+    # Check whitelist first
     if not await is_user_qualified(GROUP_ID, message.from_user.id):
         return  # Silent fail for non-qualified users
+
+    # Check force subscribe
+    force_sub_enabled = await is_force_sub_enabled()
+    if force_sub_enabled:
+        channel_id = await get_force_sub_channel()
+        if channel_id != 0:
+            is_subscribed = await check_user_subscription(message.from_user.id, channel_id)
+            
+            if not is_subscribed:
+                # Get channel info for display
+                try:
+                    channel = await bot.get_chat(channel_id)
+                    channel_username = f"@{channel.username}" if channel.username else channel.title
+                    channel_link = f"https://t.me/{channel.username}" if channel.username else None
+                except Exception:
+                    channel_username = "our channel"
+                    channel_link = None
+                
+                # Create subscription keyboard
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+                if channel_link:
+                    keyboard.inline_keyboard.append([
+                        InlineKeyboardButton(text="📢 Subscribe to Channel", url=channel_link)
+                    ])
+                keyboard.inline_keyboard.append([
+                    InlineKeyboardButton(text="✅ I Subscribed", callback_data=f"check_sub:{album_key}")
+                ])
+                
+                return await message.answer(
+                    f"⚠️ <b>Subscription Required</b>\n\n"
+                    f"To access albums, you must subscribe to {channel_username} first!\n\n"
+                    f"After subscribing, click the button below:",
+                    reply_markup=keyboard
+                )
 
     files = album.get("file_ids", [])
     if not files:
@@ -475,6 +649,121 @@ async def on_start_with_payload(message: Message):
             f"⏱ Will auto-delete in {minutes} minutes\n\n"
             f"You can close this chat now."
         )
+        # Delete confirmation after 5 seconds
+        await asyncio.sleep(5)
+        await confirmation.delete()
+    except Exception:
+        pass
+
+# ------------------ callback handler for subscription check ------------------
+@dp.callback_query(F.data.startswith("check_sub:"))
+async def cb_check_subscription(query: CallbackQuery):
+    album_key = query.data.split(":", 1)[1]
+    user = query.from_user
+    
+    # Check if force sub is still enabled
+    force_sub_enabled = await is_force_sub_enabled()
+    if not force_sub_enabled:
+        await query.answer("Force subscribe has been disabled!", show_alert=True)
+        return
+    
+    channel_id = await get_force_sub_channel()
+    if channel_id == 0:
+        await query.answer("Channel not configured!", show_alert=True)
+        return
+    
+    # Check subscription
+    is_subscribed = await check_user_subscription(user.id, channel_id)
+    
+    if not is_subscribed:
+        await query.answer("❌ You haven't subscribed yet!", show_alert=True)
+        return
+    
+    # User is subscribed, now send the album
+    album = await albums_col.find_one({"album_key": album_key})
+    if not album:
+        await query.answer("Album not found!", show_alert=True)
+        return
+    
+    # Check whitelist
+    if not await is_user_qualified(GROUP_ID, user.id):
+        await query.answer("You're not allowed to access albums!", show_alert=True)
+        return
+    
+    files = album.get("file_ids", [])
+    if not files:
+        await query.answer("Album has no files!", show_alert=True)
+        return
+    
+    # Send album to group
+    try:
+        if len(files) == 1:
+            f = files[0]
+            f_id = f["file_id"]
+            f_type = f.get("type", "document")
+            caption = f.get("caption")
+            
+            if f_type == "photo":
+                sent = await bot.send_photo(chat_id=GROUP_ID, photo=f_id, caption=caption)
+            elif f_type == "video":
+                sent = await bot.send_video(chat_id=GROUP_ID, video=f_id, caption=caption)
+            else:
+                sent = await bot.send_document(chat_id=GROUP_ID, document=f_id, caption=caption)
+            posted_ids = [sent.message_id]
+        else:
+            media = []
+            for idx, f in enumerate(files):
+                f_id = f["file_id"]
+                f_type = f.get("type", "document")
+                caption = f.get("caption") if idx == 0 else None
+                
+                if f_type == "photo":
+                    media.append(InputMediaPhoto(media=f_id, caption=caption))
+                elif f_type == "video":
+                    media.append(InputMediaVideo(media=f_id, caption=caption))
+                else:
+                    media.append(InputMediaDocument(media=f_id, caption=caption))
+            
+            sent_msgs = await bot.send_media_group(chat_id=GROUP_ID, media=media)
+            posted_ids = [m.message_id for m in sent_msgs]
+    except Exception as e:
+        logger.exception(f"Failed to send album: {e}")
+        await query.answer("Failed to send album!", show_alert=True)
+        return
+    
+    try:
+        await published_col.insert_one({
+            "album_key": album_key,
+            "chat_id": GROUP_ID,
+            "message_ids": posted_ids,
+            "published_at": int(asyncio.get_event_loop().time())
+        })
+    except Exception:
+        pass
+    
+    delay = await get_delete_seconds()
+    asyncio.create_task(_auto_delete_messages(GROUP_ID, posted_ids, delay))
+    
+    await query.answer("✅ Album sent to group!", show_alert=False)
+    
+    # Send confirmation message
+    try:
+        minutes = delay // 60
+        confirmation = await bot.send_message(
+            chat_id=query.message.chat.id,
+            text=(
+                f"✅ <b>Album sent to group!</b>\n\n"
+                f"📁 {len(files)} file(s) delivered\n"
+                f"⏱ Will auto-delete in {minutes} minutes\n\n"
+                f"You can close this chat now."
+            )
+        )
+        # Delete old subscription message
+        try:
+            await query.message.delete()
+        except:
+            pass
+        
         # Delete confirmation after 5 seconds
         await asyncio.sleep(5)
         await confirmation.delete()
@@ -578,7 +867,12 @@ async def catch_private_uploads(message: Message):
 async def on_startup():
     await settings_col.update_one(
         {"_id": "global"},
-        {"$setOnInsert": {"mode": "peace", "delete_seconds": 1800}},
+        {"$setOnInsert": {
+            "mode": "peace",
+            "delete_seconds": 1800,
+            "force_sub_enabled": False,
+            "force_sub_channel_id": 0
+        }},
         upsert=True
     )
     logger.info("✅ Bot started successfully")
@@ -603,6 +897,7 @@ if __name__ == "__main__":
         logger.error(f"❌ Fatal error: {e}")
     finally:
         asyncio.run(bot.session.close())
+
 
 
 
