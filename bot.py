@@ -308,19 +308,23 @@ async def create_collection(files: List[dict], uploader_id: int, chat_id: int, c
     # Split into chunks of 10
     chunks = [files[i:i+10] for i in range(0, len(files), 10)]
     
+    logger.info(f"Creating collection with {len(files)} files, {len(chunks)} chunks")
+    
     # Create individual albums
     album_keys = []
-    for chunk in chunks:
+    for idx, chunk in enumerate(chunks):
         album_key = make_key()
         doc = {
             "album_key": album_key,
             "file_ids": chunk,
             "uploader_id": uploader_id,
             "created_at": int(time.time()),
-            "caption": caption
+            "caption": caption if idx == 0 else None,  # Caption only on first album
+            "parent_collection": None  # Will be updated after collection is created
         }
         await albums_col.insert_one(doc)
         album_keys.append(album_key)
+        logger.info(f"Created album {idx+1}/{len(chunks)}: {album_key}")
     
     # Create collection (master)
     collection_key = make_key()
@@ -334,6 +338,14 @@ async def create_collection(files: List[dict], uploader_id: int, chat_id: int, c
         "is_collection": True
     }
     await albums_col.insert_one(collection_doc)
+    logger.info(f"Created collection: {collection_key} with {len(album_keys)} albums")
+    
+    # Update child albums to reference parent
+    for album_key in album_keys:
+        await albums_col.update_one(
+            {"album_key": album_key},
+            {"$set": {"parent_collection": collection_key}}
+        )
     
     # Send link to admin
     bot_username = (await bot.get_me()).username
@@ -347,7 +359,7 @@ async def create_collection(files: List[dict], uploader_id: int, chat_id: int, c
             text=(
                 f"✅ <b>Collection saved successfully!</b>\n\n"
                 f"📦 <b>Collection Key:</b> <code>{collection_key}</code>\n"
-                f"📁 <b>Total Files:</b> {len(files)} ({len(chunks)} albums)\n"
+                f"📁 <b>Total Files:</b> {len(files)} files in {len(chunks)} albums\n"
                 f"🔗 <b>Single Link:</b> {link}{caption_text}\n\n"
                 f"💡 <i>One click sends ALL {len(files)} files to group!</i>"
             )
@@ -767,8 +779,11 @@ async def handle_collection(message: Message, collection: dict):
     user = message.from_user
     collection_key = collection.get("collection_key")
     
+    logger.info(f"Handling collection {collection_key} for user {user.id}")
+    
     # Check whitelist
     if not await is_user_qualified(GROUP_ID, user.id):
+        logger.info(f"User {user.id} not qualified")
         return
     
     # Check force subscribe
@@ -778,6 +793,7 @@ async def handle_collection(message: Message, collection: dict):
         if channel_id != 0:
             is_subscribed = await check_user_subscription(user.id, channel_id)
             if not is_subscribed:
+                logger.info(f"User {user.id} not subscribed to force-sub channel")
                 try:
                     channel = await bot.get_chat(channel_id)
                     channel_username = f"@{channel.username}" if channel.username else channel.title
@@ -806,6 +822,7 @@ async def handle_collection(message: Message, collection: dict):
     if recent:
         caption = recent.get("caption", "this collection")
         search_hint = f'\n\n🔍 Search: <code>{caption}</code>' if caption else ""
+        logger.info(f"Collection {collection_key} already sent recently")
         return await message.answer(
             f"✅ <b>Collection Already in Group!</b>\n\n"
             f"📜 Scroll up to see it{search_hint}"
@@ -816,19 +833,28 @@ async def handle_collection(message: Message, collection: dict):
     total_files = collection.get("total_files", 0)
     collection_caption = collection.get("caption")
     
+    logger.info(f"Sending collection with {len(album_keys)} albums, {total_files} total files")
+    
     all_message_ids = []
     
-    # Send each album
-    for album_key in album_keys:
+    # Send each album sequentially
+    for idx, album_key in enumerate(album_keys):
+        logger.info(f"Fetching album {idx+1}/{len(album_keys)}: {album_key}")
         album = await get_album_cached(album_key)
         if not album:
+            logger.warning(f"Album {album_key} not found!")
             continue
         
         files = album.get("file_ids", [])
+        # Use caption from individual album (first album has caption, rest don't)
+        album_caption = album.get("caption")
+        
+        logger.info(f"Sending {len(files)} files for album {album_key}")
         
         try:
-            posted_ids = await send_files_to_group(files, collection_caption)
+            posted_ids = await send_files_to_group(files, album_caption)
             all_message_ids.extend(posted_ids)
+            logger.info(f"Album {idx+1}/{len(album_keys)} sent successfully, {len(posted_ids)} messages")
             
             # Small delay to avoid rate limits
             await asyncio.sleep(0.5)
@@ -837,7 +863,10 @@ async def handle_collection(message: Message, collection: dict):
             continue
     
     if not all_message_ids:
+        logger.error("No messages were sent!")
         return await message.answer("❌ Failed to send collection.")
+    
+    logger.info(f"Collection sent successfully, total {len(all_message_ids)} messages")
     
     # Mark collection as sent
     delete_seconds = await get_delete_seconds()
@@ -1136,6 +1165,7 @@ if __name__ == "__main__":
         logger.error(f"❌ Fatal error: {e}")
     finally:
         asyncio.run(bot.session.close())
+
 
 
 
