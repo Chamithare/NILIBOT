@@ -399,10 +399,10 @@ async def create_single_album(files: List[dict], uploader_id: int, chat_id: int,
     except Exception as e:
         logger.exception(f"Failed to notify admin about album: {e}")
 
-def _schedule_finalize(key: str, delay: float = 1.0):
+def _schedule_finalize(key: str, delay: float = 1.5):
     async def _task():
-        logger.info(f"Timer fired for buffer {key} after {delay}s")
         await asyncio.sleep(delay)
+        logger.info(f"Timer completed for buffer {key} after {delay}s, calling _finalize_buffer")
         await _finalize_buffer(key)
     
     task = asyncio.create_task(_task())
@@ -1185,6 +1185,7 @@ if __name__ == "__main__":
         logger.error(f"❌ Fatal error: {e}")
     finally:
         asyncio.run(bot.session.close())
+
 
 
 
