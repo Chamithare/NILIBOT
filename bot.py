@@ -985,10 +985,14 @@ async def cb_check_subscription(query: CallbackQuery):
             await handle_single_album(fake_msg, album, key)
 
 # ------------------ catch admin uploads in DM ------------------
-@dp.message(F.chat.type == "private", ~Command())
+@dp.message(F.chat.type == "private")
 async def catch_private_uploads(message: Message):
     user = message.from_user
     if not is_admin(user.id):
+        return
+    
+    # Ignore if it's a command (commands are handled separately)
+    if message.text and message.text.startswith('/') and message.text != '/skip':
         return
     
     logger.info(f"Received message from admin {user.id}, type: {message.content_type}, mgid: {getattr(message, 'media_group_id', None)}")
@@ -1177,8 +1181,6 @@ if __name__ == "__main__":
         logger.error(f"❌ Fatal error: {e}")
     finally:
         asyncio.run(bot.session.close())
-
-
 
 
 
