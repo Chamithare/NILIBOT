@@ -984,16 +984,19 @@ async def cb_check_subscription(query: CallbackQuery):
             )
             await handle_single_album(fake_msg, album, key)
 
-# ------------------ catch admin uploads in DM (MUST BE LAST) ------------------
-@dp.message(F.chat.type == "private")
+# ------------------ catch admin uploads in DM ------------------
+@dp.message(F.chat.type == "private", ~Command())
 async def catch_private_uploads(message: Message):
     user = message.from_user
     if not is_admin(user.id):
         return
     
+    logger.info(f"Received message from admin {user.id}, type: {message.content_type}, mgid: {getattr(message, 'media_group_id', None)}")
+    
     # Handle /skip command for caption
     if message.text and message.text.strip().lower() == "/skip":
         if user.id in _waiting_for_caption:
+            logger.info(f"User {user.id} skipped caption")
             data = _waiting_for_caption.pop(user.id)
             files = data["files"]
             chat_id = data["chat_id"]
@@ -1010,6 +1013,7 @@ async def catch_private_uploads(message: Message):
     if user.id in _waiting_for_caption:
         if message.text:
             caption = message.text.strip()
+            logger.info(f"User {user.id} provided caption: {caption}")
             data = _waiting_for_caption.pop(user.id)
             files = data["files"]
             chat_id = data["chat_id"]
@@ -1045,11 +1049,17 @@ async def catch_private_uploads(message: Message):
     elif message.animation:
         file_id = message.animation.file_id
         f_type = "document"
+    else:
+        # Not a media message we handle
+        return
+    
+    logger.info(f"File detected: type={f_type}, mgid={mgid}")
     
     if mgid:
         # Part of media group
         key = f"{user.id}:{mgid}"
         if key not in _media_buffers:
+            logger.info(f"Creating new buffer for key: {key}")
             _media_buffers[key] = {
                 "files": [],
                 "chat_id": message.chat.id,
@@ -1062,6 +1072,7 @@ async def catch_private_uploads(message: Message):
                 "file_id": file_id,
                 "type": f_type
             })
+            logger.info(f"Added file to buffer {key}, total files: {len(_media_buffers[key]['files'])}")
         
         # Forward to DB channel
         try:
@@ -1072,11 +1083,12 @@ async def catch_private_uploads(message: Message):
         # Reset timer
         if _media_buffers[key].get("timer"):
             _media_buffers[key]["timer"].cancel()
-        _schedule_finalize(key, delay=1.0)
+        _schedule_finalize(key, delay=2.0)  # Increased to 2 seconds
         return
     
     # Single file
     if file_id:
+        logger.info(f"Single file received: {f_type}")
         try:
             await message.forward(chat_id=DB_CHANNEL_ID)
         except Exception:
@@ -1165,6 +1177,7 @@ if __name__ == "__main__":
         logger.error(f"❌ Fatal error: {e}")
     finally:
         asyncio.run(bot.session.close())
+
 
 
 
