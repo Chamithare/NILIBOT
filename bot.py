@@ -401,11 +401,13 @@ async def create_single_album(files: List[dict], uploader_id: int, chat_id: int,
 
 def _schedule_finalize(key: str, delay: float = 1.0):
     async def _task():
+        logger.info(f"Timer fired for buffer {key} after {delay}s")
         await asyncio.sleep(delay)
         await _finalize_buffer(key)
     
     task = asyncio.create_task(_task())
     _media_buffers[key]["timer"] = task
+    logger.info(f"Scheduled finalize for {key} in {delay}s")
 
 # ------------------ auto-delete ------------------
 async def _auto_delete_messages(chat_id: int, message_ids: List[int], delay: int):
@@ -1089,7 +1091,7 @@ async def catch_private_uploads(message: Message):
         # Reset timer
         if _media_buffers[key].get("timer"):
             _media_buffers[key]["timer"].cancel()
-        _schedule_finalize(key, delay=2.0)  # Increased to 2 seconds
+        _schedule_finalize(key, delay=1.5)  # Wait 1.5 seconds for all files in this album
         return
     
     # Single file
@@ -1183,6 +1185,7 @@ if __name__ == "__main__":
         logger.error(f"❌ Fatal error: {e}")
     finally:
         asyncio.run(bot.session.close())
+
 
 
 
