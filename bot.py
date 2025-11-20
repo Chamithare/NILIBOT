@@ -52,6 +52,7 @@ qualified_col = db["qualified"]
 # ------------------ in-memory caches & buffers ------------------
 _media_buffers: Dict[str, Dict] = {}  # Media group collection buffer
 _waiting_for_caption: Dict[int, Dict] = {}  # Users waiting to provide caption
+_user_upload_sessions: Dict[int, Dict] = {}  # Track user upload sessions: user_id -> {albums: [...], timer: Task}
 
 # Cache systems for performance
 album_cache: Dict[str, Tuple[dict, float]] = {}  # album_key -> (data, timestamp)
@@ -60,6 +61,7 @@ recently_sent: Dict[str, Dict] = {}  # album_key -> {sent_at, expires_at, messag
 
 CACHE_TTL = 1800  # 30 minutes for album cache
 SETTINGS_CACHE_TTL = 300  # 5 minutes for settings
+UPLOAD_SESSION_TIMEOUT = 3.0  # 3 seconds to wait for more albums
 
 # ------------------ utilities ------------------
 def is_admin(uid: int) -> bool:
